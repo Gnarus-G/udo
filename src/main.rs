@@ -16,7 +16,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Natural-language task description (shorthand for `udo run <prompt>`)
+    /// Natural-language task description (runs when no subcommand is given)
     prompt: Option<String>,
 
     /// Ollama model to use
@@ -34,15 +34,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a task (default when no subcommand given)
-    Run {
-        /// Natural-language task description
-        prompt: String,
-
-        /// Ollama model to use
-        #[arg(long, env = "UDO_MODEL", default_value = "glm-5.1:cloud")]
-        model: String,
-    },
     /// Watch task progress in a TUI
     Watch {
         /// Specific task id to watch (watches all recent if omitted)
@@ -65,7 +56,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Run { prompt, model }) => frontend::run(prompt, model),
         Some(Commands::Watch { task_id }) => watch::run(task_id),
         Some(Commands::Status) => {
             let status = progress::eww_status();
@@ -77,13 +67,33 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&ids)?);
             Ok(())
         }
-        None => {
-            if let Some(prompt) = cli.prompt {
+        None => match cli.prompt {
+            Some(prompt) => frontend::run(prompt, cli.model),
+            None => {
+                let prompt = read_prompt_interactively()?;
                 frontend::run(prompt, cli.model)
-            } else {
-                eprintln!("udo: provide a prompt or use a subcommand (run, watch, status, list)");
-                std::process::exit(1);
             }
-        }
+        },
+    }
+}
+
+fn read_prompt_interactively() -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdin.lock(), &mut buf)?;
+        let s = String::from_utf8(buf)?;
+        let trimmed = s.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "no prompt provided on stdin");
+        return Ok(trimmed.to_string());
+    }
+
+    let q = inquire::Text::new("What should udo do?").with_help_message("⏎ to submit · Esc to cancel");
+    match q.prompt() {
+        Ok(s) if s.is_empty() => anyhow::bail!("empty prompt"),
+        Ok(s) => Ok(s),
+        Err(inquire::InquireError::OperationCanceled) => anyhow::bail!("cancelled"),
+        Err(e) => Err(e.into()),
     }
 }

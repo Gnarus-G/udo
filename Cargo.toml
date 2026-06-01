@@ -17,6 +17,7 @@ rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 ratatui = "0.30"
 crossterm = "0.28"
+inquire = "0.9"
 
 [profile.release]
 lto = "thin"
