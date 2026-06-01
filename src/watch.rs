@@ -4,7 +4,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 
 use crate::progress;
@@ -22,6 +22,10 @@ struct App {
     list_state: ListState,
     focused_task_id: Option<String>,
     refresh_counter: usize,
+    events: Vec<progress::TimedEvent>,
+    event_scroll: usize,
+    event_viewport_height: usize,
+    last_event_count: usize,
 }
 
 impl App {
@@ -32,6 +36,10 @@ impl App {
             list_state: ListState::default(),
             focused_task_id: focused,
             refresh_counter: 0,
+            events: Vec::new(),
+            event_scroll: 0,
+            event_viewport_height: 0,
+            last_event_count: 0,
         };
         app.refresh();
         if !app.task_ids.is_empty() && app.selected.is_none() {
@@ -44,6 +52,7 @@ impl App {
                 app.list_state.select(Some(idx));
             }
         }
+        app.reload_events();
         app
     }
 
@@ -63,6 +72,7 @@ impl App {
         if current > 0 {
             self.list_state.select(Some(current - 1));
             self.selected = self.task_ids.get(current - 1).cloned();
+            self.reload_events();
         }
     }
 
@@ -74,7 +84,55 @@ impl App {
         if current < self.task_ids.len() - 1 {
             self.list_state.select(Some(current + 1));
             self.selected = self.task_ids.get(current + 1).cloned();
+            self.reload_events();
         }
+    }
+
+    fn reload_events(&mut self) {
+        if let Some(id) = &self.selected {
+            let events = progress::read_events(id).unwrap_or_default();
+            self.events = events;
+        } else {
+            self.events.clear();
+        }
+        self.last_event_count = self.events.len();
+        self.event_scroll = 0;
+    }
+
+    fn maybe_reload_events(&mut self) {
+        if let Some(id) = &self.selected {
+            let events = progress::read_events(id).unwrap_or_default();
+            if events.len() != self.last_event_count {
+                let was_at_bottom = self.scrolled_to_bottom();
+                self.events = events;
+                self.last_event_count = self.events.len();
+                if was_at_bottom {
+                    self.event_scroll = self.max_scroll();
+                }
+            }
+        }
+    }
+
+    fn viewport_h(&self) -> usize {
+        self.event_viewport_height.saturating_sub(2).max(1)
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.events.len().saturating_sub(self.viewport_h())
+    }
+
+    fn scrolled_to_bottom(&self) -> bool {
+        self.event_scroll >= self.max_scroll()
+    }
+
+    fn page_up(&mut self) {
+        let page = self.viewport_h();
+        self.event_scroll = self.event_scroll.saturating_sub(page);
+    }
+
+    fn page_down(&mut self) {
+        let page = self.viewport_h();
+        self.event_scroll = (self.event_scroll + page).min(self.max_scroll());
     }
 }
 
@@ -83,7 +141,7 @@ fn run_app(mut terminal: ratatui::DefaultTerminal, task_id: Option<String>) -> R
     let tick_rate = std::time::Duration::from_millis(250);
 
     loop {
-        terminal.draw(|f| render(f, &app))?;
+        terminal.draw(|f| render(f, &mut app))?;
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
@@ -92,6 +150,8 @@ fn run_app(mut terminal: ratatui::DefaultTerminal, task_id: Option<String>) -> R
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Up | KeyCode::Char('k') => app.select_up(),
                         KeyCode::Down | KeyCode::Char('j') => app.select_down(),
+                        KeyCode::PageUp => app.page_up(),
+                        KeyCode::PageDown => app.page_down(),
                         _ => {}
                     }
                 }
@@ -101,12 +161,13 @@ fn run_app(mut terminal: ratatui::DefaultTerminal, task_id: Option<String>) -> R
         app.refresh_counter += 1;
         if app.refresh_counter % 4 == 0 {
             app.refresh();
+            app.maybe_reload_events();
         }
     }
     Ok(())
 }
 
-fn render(f: &mut Frame, app: &App) {
+fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     if app.task_ids.is_empty() {
@@ -130,7 +191,7 @@ fn render(f: &mut Frame, app: &App) {
     render_events(f, detail_area, app);
 }
 
-fn render_list(f: &mut Frame, area: Rect, app: &App) {
+fn render_list(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .task_ids
         .iter()
@@ -150,12 +211,8 @@ fn render_list(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::bordered()
-            .title(" tasks ")
-            .style(Style::default()),
-    );
-    f.render_stateful_widget(list, area, &mut app.list_state.clone());
+    let list = List::new(items).block(Block::bordered().title(" tasks "));
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App) {
@@ -236,25 +293,25 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(widget, area);
 }
 
-fn render_events(f: &mut Frame, area: Rect, app: &App) {
-    let selected_id = match &app.selected {
-        Some(id) => id.as_str(),
-        None => {
-            f.render_widget(
-                Paragraph::new("").block(Block::bordered().title(" events ")),
-                area,
-            );
-            return;
-        }
-    };
+fn render_events(f: &mut Frame, area: Rect, app: &mut App) {
+    app.event_viewport_height = area.height as usize;
 
-    let events = progress::read_events(selected_id).unwrap_or_default();
+    if app.selected.is_none() {
+        f.render_widget(
+            Paragraph::new("").block(Block::bordered().title(" events ")),
+            area,
+        );
+        return;
+    }
+
     let now = Utc::now();
-    let items: Vec<ListItem> = events
+    let total = app.events.len();
+    let all_items: Vec<ListItem> = app
+        .events
         .iter()
-        .rev()
-        .take(area.height.saturating_sub(2) as usize)
-        .map(|te| {
+        .enumerate()
+        .map(|(idx, te)| {
+            let n = idx + 1;
             let age = (now - te.ts).num_seconds();
             let age_str = if age < 60 {
                 format!("{age}s")
@@ -290,6 +347,7 @@ fn render_events(f: &mut Frame, area: Rect, app: &App) {
                 progress::Event::Failed { .. } => ("✗", Color::Red),
             };
             ListItem::new(Line::from(vec![
+                Span::styled(format!("{n:>3} "), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{age_str:>4} "), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{marker} "), Style::default().fg(color)),
                 Span::raw(desc),
@@ -297,8 +355,37 @@ fn render_events(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title(" events "));
+    let visible_h = app.viewport_h();
+    let max = app.max_scroll();
+    let offset = app.event_scroll.min(max);
+    let start = offset;
+    let end = (offset + visible_h).min(total);
+    let visible: Vec<ListItem> = all_items[start..end].to_vec();
+
+    let title = if total > visible_h {
+        format!(
+            " events ({} events, showing {}-{} of {}) ",
+            total,
+            start + 1,
+            end,
+            total
+        )
+    } else {
+        format!(" events ({} events) ", total)
+    };
+
+    let list = List::new(visible).block(Block::bordered().title(title));
     f.render_widget(list, area);
+
+    if max > 0 {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        let mut sb_state = ScrollbarState::new(max + 1).position(offset);
+        let inner = Block::bordered().inner(area);
+        f.render_stateful_widget(scrollbar, inner, &mut sb_state);
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
