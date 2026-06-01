@@ -172,18 +172,17 @@ pub fn snapshot(task_id: &str) -> Option<TaskSnapshot> {
 
 pub fn list_task_ids() -> Result<Vec<String>> {
     let dir = paths::task_dir()?;
-    let mut ids = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "jsonl") {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.push(name.to_string());
-            }
-        }
-    }
-    ids.sort();
-    Ok(ids)
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter_map(|e| {
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            let name = e.path().file_stem()?.to_str()?.to_string();
+            Some((mtime, name))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(entries.into_iter().map(|(_, name)| name).collect())
 }
 
 #[derive(Serialize)]

@@ -58,8 +58,6 @@ impl App {
 
     fn refresh(&mut self) {
         if let Ok(ids) = progress::list_task_ids() {
-            let mut ids = ids;
-            ids.reverse();
             self.task_ids = ids;
         }
     }
