@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Scrollbar, S
 use ratatui::Frame;
 
 use crate::progress;
+use crate::text;
 
 pub fn run(task_id: Option<String>) -> Result<()> {
     let terminal = ratatui::init();
@@ -141,23 +142,22 @@ fn run_app(mut terminal: ratatui::DefaultTerminal, task_id: Option<String>) -> R
     loop {
         terminal.draw(|f| render(f, &mut app))?;
 
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => app.select_up(),
-                        KeyCode::Down | KeyCode::Char('j') => app.select_down(),
-                        KeyCode::PageUp => app.page_up(),
-                        KeyCode::PageDown => app.page_down(),
-                        _ => {}
-                    }
-                }
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Up | KeyCode::Char('k') => app.select_up(),
+                KeyCode::Down | KeyCode::Char('j') => app.select_down(),
+                KeyCode::PageUp => app.page_up(),
+                KeyCode::PageDown => app.page_down(),
+                _ => {}
             }
         }
 
         app.refresh_counter += 1;
-        if app.refresh_counter % 4 == 0 {
+        if app.refresh_counter.is_multiple_of(4) {
             app.refresh();
             app.maybe_reload_events();
         }
@@ -250,13 +250,13 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     let state_str = format!("{:?}", snap.state).to_lowercase();
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("{state_str}"), state_style),
+            Span::styled(state_str.to_string(), state_style),
             Span::raw(format!("  iter {}/25", snap.iter)),
             Span::raw(format!("  model {}", snap.model)),
         ]),
         Line::from(vec![
             Span::styled("prompt: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(truncate_str(&snap.prompt, 120)),
+            Span::raw(text::truncate(&snap.prompt, 120)),
         ]),
         Line::from(vec![
             Span::styled("updated: ", Style::default().fg(Color::DarkGray)),
@@ -268,19 +268,19 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     if let Some(ref cmd) = snap.current_command {
         extra.push(Line::from(vec![
             Span::styled("running: ", Style::default().fg(Color::Yellow)),
-            Span::raw(truncate_str(cmd, 120)),
+            Span::raw(text::truncate(cmd, 120)),
         ]));
     }
     if let Some(ref summary) = snap.summary {
         extra.push(Line::from(vec![
             Span::styled("result: ", Style::default().fg(Color::Green)),
-            Span::raw(truncate_str(summary, 120)),
+            Span::raw(text::truncate(summary, 120)),
         ]));
     }
     if let Some(ref err) = snap.error {
         extra.push(Line::from(vec![
             Span::styled("error: ", Style::default().fg(Color::Red)),
-            Span::raw(truncate_str(err, 120)),
+            Span::raw(text::truncate(err, 120)),
         ]));
     }
 
@@ -289,6 +289,48 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::bordered().title(format!(" {selected_id} ")))
         .wrap(Wrap { trim: true });
     f.render_widget(widget, area);
+}
+
+fn event_description(ev: &progress::Event) -> String {
+    match ev {
+        progress::Event::Started { model, .. } => format!("started (model: {model})"),
+        progress::Event::IterationStarted { iter } => format!("iteration {iter}"),
+        progress::Event::ModelRequestStarted { .. } => "model request".into(),
+        progress::Event::ModelResponseReceived { .. } => "model response".into(),
+        progress::Event::ToolStarted { command, .. } => {
+            format!("bash: {}", text::truncate(command, 80))
+        }
+        progress::Event::ToolFinished {
+            command, exit_code, ..
+        } => {
+            let ec: String = if *exit_code == 0 {
+                "ok".into()
+            } else {
+                format!("exit({exit_code})")
+            };
+            format!("{ec} {}", text::truncate(command, 70))
+        }
+        progress::Event::Completed { summary } => {
+            format!("done: {}", text::truncate(summary, 80))
+        }
+        progress::Event::Failed { error } => {
+            format!("failed: {}", text::truncate(error, 80))
+        }
+    }
+}
+
+fn event_style(ev: &progress::Event) -> (char, Color) {
+    match ev {
+        progress::Event::Started { .. } => ('\u{25B6}', Color::Cyan),
+        progress::Event::IterationStarted { .. } => ('\u{21BB}', Color::DarkGray),
+        progress::Event::ModelRequestStarted { .. } => ('\u{2191}', Color::Blue),
+        progress::Event::ModelResponseReceived { .. } => ('\u{2193}', Color::Blue),
+        progress::Event::ToolStarted { .. } => ('$', Color::Yellow),
+        progress::Event::ToolFinished { exit_code, .. } if *exit_code != 0 => ('\u{2717}', Color::Red),
+        progress::Event::ToolFinished { .. } => ('\u{2713}', Color::Green),
+        progress::Event::Completed { .. } => ('\u{2713}', Color::Green),
+        progress::Event::Failed { .. } => ('\u{2717}', Color::Red),
+    }
 }
 
 fn render_events(f: &mut Frame, area: Rect, app: &mut App) {
@@ -318,32 +360,8 @@ fn render_events(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 format!("{}h", age / 3600)
             };
-            let desc = match &te.event {
-                progress::Event::Started { model, .. } => format!("started (model: {model})"),
-                progress::Event::IterationStarted { iter } => format!("iteration {iter}"),
-                progress::Event::ModelRequestStarted { .. } => "model request".into(),
-                progress::Event::ModelResponseReceived { .. } => "model response".into(),
-                progress::Event::ToolStarted { command, .. } => format!("bash: {}", truncate_str(command, 80)),
-                progress::Event::ToolFinished {
-                    command, exit_code, ..
-                } => {
-                    let ec: String = if *exit_code == 0 { "ok".into() } else { format!("exit({exit_code})") };
-                    format!("{ec} {}", truncate_str(command, 70))
-                }
-                progress::Event::Completed { summary } => format!("done: {}", truncate_str(summary, 80)),
-                progress::Event::Failed { error } => format!("failed: {}", truncate_str(error, 80)),
-            };
-            let (marker, color) = match &te.event {
-                progress::Event::Started { .. } => ("▶", Color::Cyan),
-                progress::Event::IterationStarted { .. } => ("↻", Color::DarkGray),
-                progress::Event::ModelRequestStarted { .. } => ("↑", Color::Blue),
-                progress::Event::ModelResponseReceived { .. } => ("↓", Color::Blue),
-                progress::Event::ToolStarted { .. } => ("$", Color::Yellow),
-                progress::Event::ToolFinished { exit_code, .. } if *exit_code != 0 => ("✗", Color::Red),
-                progress::Event::ToolFinished { .. } => ("✓", Color::Green),
-                progress::Event::Completed { .. } => ("✓", Color::Green),
-                progress::Event::Failed { .. } => ("✗", Color::Red),
-            };
+            let (marker, color) = event_style(&te.event);
+            let desc = event_description(&te.event);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{n:>3} "), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{age_str:>4} "), Style::default().fg(Color::DarkGray)),
@@ -383,15 +401,5 @@ fn render_events(f: &mut Frame, area: Rect, app: &mut App) {
         let mut sb_state = ScrollbarState::new(max + 1).position(offset);
         let inner = Block::bordered().inner(area);
         f.render_stateful_widget(scrollbar, inner, &mut sb_state);
-    }
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
     }
 }
