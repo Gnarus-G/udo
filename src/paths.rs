@@ -11,16 +11,18 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn log_dir() -> Result<PathBuf> {
-    let dir = state_dir()?.join("log");
+fn ensure_subdir(name: &str) -> Result<PathBuf> {
+    let dir = state_dir()?.join(name);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
 
+pub fn log_dir() -> Result<PathBuf> {
+    ensure_subdir("log")
+}
+
 pub fn task_dir() -> Result<PathBuf> {
-    let dir = state_dir()?.join("tasks");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
+    ensure_subdir("tasks")
 }
 
 pub fn log_file(task_id: &str) -> Result<PathBuf> {

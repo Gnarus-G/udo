@@ -5,6 +5,7 @@ mod notify;
 mod ollama;
 mod paths;
 mod progress;
+mod text;
 mod watch;
 mod worker;
 
