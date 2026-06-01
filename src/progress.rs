@@ -174,7 +174,7 @@ pub fn list_task_ids() -> Result<Vec<String>> {
     let dir = paths::task_dir()?;
     let mut entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .filter_map(|e| {
             let mtime = e.metadata().ok()?.modified().ok()?;
             let name = e.path().file_stem()?.to_str()?.to_string();
@@ -204,6 +204,119 @@ pub struct LatestTask {
 
 const VISIBILITY_SECS: i64 = 900;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Worst {
+    Completed,
+    Failed,
+    Running,
+}
+
+impl PartialOrd for Worst {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Worst {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        rank(*self).cmp(&rank(*other))
+    }
+}
+
+fn rank(w: Worst) -> u8 {
+    match w {
+        Worst::Completed => 0,
+        Worst::Failed => 1,
+        Worst::Running => 2,
+    }
+}
+
+#[derive(Default)]
+struct Aggregate {
+    running_count: usize,
+    recent_count: usize,
+    worst: Option<Worst>,
+    latest: Option<LatestTask>,
+}
+
+impl Aggregate {
+    fn fold(&mut self, snap: TaskSnapshot, now: DateTime<Utc>) {
+        let age = (now - snap.updated_at).num_seconds();
+        let visible = age <= VISIBILITY_SECS;
+        let worst = match snap.state {
+            TaskState::Running => {
+                self.running_count += 1;
+                if visible {
+                    self.recent_count += 1;
+                    Some(Worst::Running)
+                } else {
+                    None
+                }
+            }
+            TaskState::Failed => {
+                if visible {
+                    self.recent_count += 1;
+                    Some(Worst::Failed)
+                } else {
+                    None
+                }
+            }
+            TaskState::Completed => {
+                if visible {
+                    self.recent_count += 1;
+                    Some(Worst::Completed)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(w) = worst {
+            self.worst = Some(match self.worst {
+                Some(cur) => cur.max(w),
+                None => w,
+            });
+        }
+        let replace = self
+            .latest
+            .as_ref()
+            .is_none_or(|l| snap.updated_at > now - chrono::Duration::seconds(l.updated_secs_ago));
+        if replace {
+            let summary = snap
+                .summary
+                .clone()
+                .or_else(|| snap.error.clone())
+                .or_else(|| snap.current_command.clone())
+                .unwrap_or_else(|| snap.prompt.chars().take(60).collect());
+            self.latest = Some(LatestTask {
+                task_id: snap.task_id,
+                state: format!("{:?}", snap.state).to_lowercase(),
+                summary,
+                updated_secs_ago: age,
+            });
+        }
+    }
+
+    fn finish(self) -> EwwStatus {
+        let worst_state = self
+            .worst
+            .map(|w| match w {
+                Worst::Running => "running",
+                Worst::Failed => "failed",
+                Worst::Completed => "completed",
+            })
+            .map(str::to_string)
+            .or_else(|| self.latest.as_ref().map(|_| "completed".to_string()))
+            .unwrap_or_default();
+        EwwStatus {
+            running_count: self.running_count,
+            recent_count: self.recent_count,
+            has_visible: self.recent_count > 0 || self.running_count > 0,
+            worst_state,
+            latest: self.latest,
+        }
+    }
+}
+
 pub fn eww_status() -> EwwStatus {
     let Ok(ids) = list_task_ids() else {
         return EwwStatus {
@@ -215,78 +328,11 @@ pub fn eww_status() -> EwwStatus {
         };
     };
     let now = Utc::now();
-    let mut running = 0usize;
-    let mut recent = 0usize;
-    let mut worst = String::new();
-    let mut latest: Option<LatestTask> = None;
+    let mut agg = Aggregate::default();
     for id in &ids {
-        let Some(snap) = snapshot(id) else {
-            continue;
-        };
-        let age = (now - snap.updated_at).num_seconds();
-        let visible = age <= VISIBILITY_SECS;
-        match snap.state {
-            TaskState::Running => {
-                running += 1;
-                if visible {
-                    recent += 1;
-                    if worst != "running" {
-                        worst = "running".to_string();
-                    }
-                }
-            }
-            TaskState::Failed => {
-                if visible {
-                    recent += 1;
-                    if worst != "running" {
-                        worst = "failed".to_string();
-                    }
-                }
-            }
-            TaskState::Completed => {
-                if visible {
-                    recent += 1;
-                    if worst.is_empty() {
-                        worst = "completed".to_string();
-                    }
-                }
-            }
-        }
-        match &mut latest {
-            None => {
-                latest = Some(LatestTask {
-                    task_id: snap.task_id.clone(),
-                    state: format!("{:?}", snap.state).to_lowercase(),
-                    summary: snap
-                        .summary
-                        .or(snap.error)
-                        .or(snap.current_command.clone())
-                        .unwrap_or_else(|| snap.prompt.chars().take(60).collect()),
-                    updated_secs_ago: age,
-                });
-            }
-            Some(l) => {
-                if snap.updated_at > now - chrono::Duration::seconds(l.updated_secs_ago) {
-                    l.task_id = snap.task_id.clone();
-                    l.state = format!("{:?}", snap.state).to_lowercase();
-                    l.summary = snap
-                        .summary
-                        .or(snap.error)
-                        .or(snap.current_command.clone())
-                        .unwrap_or_else(|| snap.prompt.chars().take(60).collect());
-                    l.updated_secs_ago = age;
-                }
-            }
+        if let Some(snap) = snapshot(id) {
+            agg.fold(snap, now);
         }
     }
-    if worst.is_empty() && latest.is_some() {
-        worst = "completed".to_string();
-    }
-    EwwStatus {
-        running_count: running,
-        recent_count: recent,
-        has_visible: recent > 0 || running > 0,
-        worst_state: worst,
-        latest,
-    }
+    agg.finish()
 }
