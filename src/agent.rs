@@ -2,11 +2,17 @@ use anyhow::{Context, Result};
 
 use crate::bash;
 use crate::ollama::{self, Client, Message};
+use crate::progress::{Event, ProgressWriter};
 
 const MAX_ITER: usize = 25;
 const SYSTEM_PROMPT: &str = "You are a bash agent on Linux. Use the `bash` tool to accomplish the user's task in as few commands as possible. Inspect output as needed. When the task is done, reply with a single short sentence summarizing what you did, and stop calling tools. If the task is impossible or unsafe, explain briefly and stop.";
 
-pub async fn run(client: &Client, model: &str, prompt: &str) -> Result<String> {
+pub async fn run(
+    client: &Client,
+    model: &str,
+    prompt: &str,
+    pw: &mut ProgressWriter,
+) -> Result<String> {
     let mut messages = vec![
         Message {
             role: "system".into(),
@@ -23,7 +29,11 @@ pub async fn run(client: &Client, model: &str, prompt: &str) -> Result<String> {
 
     for iter in 1..=MAX_ITER {
         println!("--- iteration {iter} ---");
+        let _ = pw.emit(Event::IterationStarted { iter });
+
+        let _ = pw.emit(Event::ModelRequestStarted { iter });
         let msg = client.chat(model, &messages, &tools).await?;
+        let _ = pw.emit(Event::ModelResponseReceived { iter });
 
         let calls = msg.tool_calls.clone().unwrap_or_default();
         let content = msg.content.clone();
@@ -42,6 +52,10 @@ pub async fn run(client: &Client, model: &str, prompt: &str) -> Result<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             println!("$ {cmd}");
+            let _ = pw.emit(Event::ToolStarted {
+                iter,
+                command: cmd.to_string(),
+            });
             let result = bash::run(cmd).await;
             println!(
                 "  exit={} stdout={}B stderr={}B",
@@ -49,6 +63,13 @@ pub async fn run(client: &Client, model: &str, prompt: &str) -> Result<String> {
                 result.stdout.len(),
                 result.stderr.len()
             );
+            let _ = pw.emit(Event::ToolFinished {
+                iter,
+                command: cmd.to_string(),
+                exit_code: result.exit_code,
+                stdout_len: result.stdout.len(),
+                stderr_len: result.stderr.len(),
+            });
             let serialized = serde_json::to_string(&result).context("serializing tool result")?;
             messages.push(Message {
                 role: "tool".into(),

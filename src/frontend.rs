@@ -46,5 +46,6 @@ pub fn run(prompt: String, model: String) -> Result<()> {
         child.id(),
         log_path.display()
     );
+    println!("  watch with: udo watch {}", task_id);
     Ok(())
 }
